@@ -1,0 +1,1362 @@
+---
+title: "Summative-2"
+output: html_document
+date: "2024-04-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(tree)
+library(rpart)
+library(randomForest)
+library(caret)
+library(rpart.plot)
+library(VIM)
+library(e1071)
+library(plotROC)
+library(pROC)
+library(ROCit)
+library(xgboost)
+library(glmnet)
+library(methods)
+```
+
+File Import
+```{r}
+## Importing df
+df <- read.csv("diabetic_data.csv") # change accordingly 
+
+nrow(df)
+ncol(df)
+
+```
+
+
+# PRE-PROCESSING-----------------
+
+Overview and correction of data types
+```{r}
+str(df)
+
+```
+
+All "character" variables should be factors.
+Having identified some "integer" variables as factors, we specify this.
+
+```{r}
+# Identify columns with class "character"
+character_columns <- sapply(df, class) == "character"
+
+# Convert character columns to factor columns
+df <- mutate_if(df, character_columns, as.factor)
+
+df$admission_type_id<- as.factor(df$admission_type_id)
+df$discharge_disposition_id<- as.factor(df$discharge_disposition_id)
+df$admission_source_id<- as.factor(df$admission_source_id)
+
+str(df)
+```
+
+## Defining what we want to predict
+With this dataset there are a few things we could attempt to predict.
+The column readmitted contains 3 factors:
+
+```{r}
+table(df$readmitted)
+```
+Lots of literature attempts to predict "early" readmission - ie. readmission within 30 days.
+We will instead attempt to predict readmission within 1 year, meaning <30 and >30.
+
+```{r}
+df$readmitted <- (df$readmitted != "NO") # labels any point with re-admission as TRUE
+# df$readmitted <- (df$readmitted == "<30")
+df$readmitted <- factor(df$readmitted) # Identify readmitted as a factor
+```
+
+## Check Missing Values
+
+Missing values are denoted by "?" 
+
+```{r}
+missing_values = sapply(df, function(x) any(x == "?")) # missing values denoted by "?"
+
+# Proportion of column with ? 
+sapply(df[missing_values], function(x) {round(
+  sum(x == "?") / length(x),3)
+})
+```
+Weight is removed because 96.9% of values are missing.
+Payer code is removed because it is irrelevant to the task.
+Medical specialty has around 50% of values missing and any information it may provide can be inferred by other variables so we remove.
+
+```{r}
+df = df[, -which(names(df) == "weight")]
+df = df[, -which(names(df) == "payer_code")]
+df = df[, -which(names(df) == "medical_specialty")]
+```
+
+## Removing invalid and unknown gender observations
+```{r}
+table(df["gender"])
+
+df = df[-which(df[,"gender"]=="Unknown/Invalid"),]
+```
+
+## Removing patients with specific discharge conditions
+The discharge ID codes 11, 13, 14, 19, 20, 21 all specify patients being leaving 
+due to death or entering hospice and therefore there is guarantee they will not 
+return. We remove these observations to avoid bias. 
+
+```{r}
+delete_rows <- function(data, discharge_col) {
+  # rows' index
+  indices_to_delete <- which(discharge_col %in% c('11', '13', '14', '19', '20', '21'))
+  
+  # deletion
+  data <- data[-indices_to_delete, ]
+  
+  return(data)
+}
+
+# nrow(df) # 101763 before
+
+df <- delete_rows(df, df$discharge_disposition_id)
+
+# nrow(df) # 99340 after
+```
+
+## Identifying unique patient vists
+We only want to keep the first visit from any patient. We identify this through
+their patient ID number.
+We then de-identify the dataset by removing the encounter_id and patient_nbr
+
+```{r}
+cat("Number of unique values in patient_nbr column:", length(unique(df$patient_nbr)),
+    "and encounter_id column:", length(unique(df$encounter_id)))
+
+unique_patient_nbr <- unique(df$patient_nbr)
+df <- df[match(unique_patient_nbr, df$patient_nbr), ]
+
+df = df[, -which(names(df) == "encounter_id")]
+df = df[, -which(names(df) == "patient_nbr")]
+```
+
+## Removing variables with only one level as the are negligible 
+```{r}
+sapply(df, function(x) length(levels(factor(x))))
+
+df = df[, -which(names(df) == "citoglipton")]
+df = df[, -which(names(df) == "glimepiride.pioglitazone")]
+df = df[, -which(names(df) == "examide")]
+```
+
+
+## Measure number of patient visits in previous year 
+We make a variable recording the totatl number of visits - combining inpatient,emergency 
+and outpatient visits 
+
+```{r}
+df[,"number_outpatient"]=(df$number_emergency+df$number_inpatient+df$number_outpatient)
+df = df[, !names(df) %in% c("number_emergency", "number_inpatient")]
+names(df)[names(df)=="number_outpatient"]="number_visit"
+```
+
+## Medication changes
+The dataset now contains 20 features (originally 24) which are drugs and they indicate whether a change
+in that medication was made. For example:
+
+```{r}
+table(df["metformin"]) # replace with different medications
+```
+
+The feature "num_medications" tells us the number of medications used on a patient.
+
+We will create a new feature "medication_change" which will count the number of
+changes to medication variables listed (a change would be "Down, Up")
+
+```{r, eval=FALSE}
+# # Initialize an empty vector to store medication change counts for each row
+# num_medication_change <- numeric(nrow(df))
+# 
+# # Specify the columns containing medication names
+# medication_columns <- c("metformin","repaglinide","nateglinide","chlorpropamide","glimepiride",           
+# "acetohexamide","glipizide","glyburide","tolbutamide","pioglitazone","rosiglitazone","acarbose","miglitol","troglitazone","tolazamide",              
+# "insulin","glyburide.metformin","glipizide.metformin","metformin.rosiglitazone","metformin.pioglitazone")
+# 
+# # Loop through each row of the dataframe
+# for (i in 1:nrow(df)) {
+#   # Sum the number of medications that are not "No" or "Steady"
+#   num_medication_change[i] <- sum(df[i, medication_columns] != "No" & df[i, medication_columns] != "Steady")
+# }
+# 
+# table(num_medication_change)
+# 
+# write.csv(num_medication_change, "num_medication_change.csv", row.names = FALSE)
+```
+
+###This takes a while to count so we save the results to a csv file which can be imported instead of rerunning this code.
+
+```{r}
+num_medication_change = read.csv("num_medication_change.csv")
+
+df = df %>%
+  mutate(num_medication_change = unlist(num_medication_change))
+
+# Changing column names
+names(df)[which(names(df)=="change")]="diabetesMed_changed"
+df$num_medication_change = as.integer(df$num_medication_change)
+
+```
+
+## Correcting ages
+Ages are given in the form [0,10),[10,20) etc. in ranges of 10, we assign the mid value
+to the age variable because we want the model to view it as a numerical value not categorical.
+
+```{r}
+extract_bounds <- function(age) {
+  bounds <- gsub("\\[|\\)", "", age)  # Remove "[" and ")"
+  bounds <- as.numeric(unlist(strsplit(bounds, "-")))  # Split and convert to numeric
+  return(bounds)
+}
+
+# Extract lower and upper bounds for each age range, generate a random age within the range
+upper <- sapply(df$age, function(x) {
+  bounds <- extract_bounds(x)
+  (bounds[1]+bounds[2])/2# Generate random age
+})
+
+df$age = upper
+df$age = factor(df$age, ordered = TRUE)
+
+```
+
+## Categorising diagnoses
+Combining types of diagnosis in common categories for simplicity based on ICD9 codes.
+The classifications are taken from the literature.
+
+```{r}
+# Current codes
+# table(df$diag_1) 
+
+classify_diag <- function(diag) {
+  
+  # record the missing value indices, avoid mixing with elements with letters when transform
+  missing_indices <- which(diag == "?")
+  
+  diag = as.numeric(diag)
+  classified <- case_when(
+    (diag >= 390 & diag <= 459) | (diag == 785) ~ "circulatory",
+    (diag >= 460 & diag <= 519) | (diag == 786) ~ "respiratory",
+    (diag >= 520 & diag <= 579) | (diag == 787) ~ "digestive",
+    (diag >= 250 & diag < 251) ~ "diabetes",
+    (diag >= 800 & diag <= 999) ~ "injury",
+    (diag >= 710 & diag <= 739) ~ "musculoskeletal",
+    (diag >= 580 & diag <= 629) | (diag == 788) ~ "genitourinary",
+    (diag >= 140 & diag <= 239) | (diag == 780) | (diag == 781) | (diag == 784) | 
+      (diag >= 790 & diag <= 799) | (diag >= 240 & diag <= 249) | 
+      (diag >= 251 & diag <= 279) ~ "neoplasms",
+    TRUE ~ "other")
+  
+  
+  classified[missing_indices] = "?"
+  classified = as.factor(classified)
+  return(classified)
+}
+
+# Categorising the diagnosis columns
+
+df$diag_1 <- classify_diag(df$diag_1)
+df$diag_2 <- classify_diag(df$diag_2)
+df$diag_3 <- classify_diag(df$diag_3)
+```
+
+## Dealing with Glucose serum and A1C test results
+A1C = hemoglobin A1C is a measure of average blood sugar level, it can either be 
+normal, abnormal or not recorded
+
+Glucose serum level = measurement of amount of glucose in the blood. Again it can be
+normal, abnormal or not recorded.
+
+We reduce the categories of both variables to "Normal", "Abnormal" and "None"
+
+```{r}
+table(df$max_glu_serum)
+table(df$A1Cresult)
+
+df$max_glu_serum <- as.character(df$max_glu_serum)
+df$A1Cresult <- as.character(df$A1Cresult)
+
+df[df$max_glu_serum == ">200" | df$max_glu_serum == ">300","max_glu_serum"] = "Abnormal"
+df[df$A1Cresult == ">7" | df$A1Cresult == ">8","A1Cresult"] = "Abnormal"
+
+df$max_glu_serum <- as.factor(df$max_glu_serum)
+df$A1Cresult <- as.factor(df$A1Cresult)
+
+table(df$max_glu_serum)
+table(df$A1Cresult)
+```
+
+## Labelling and grouping other variables
+```{r}
+## Admission type
+df$admission_type_id <- as.character(df$admission_type_id)
+df[df$admission_type_id %in% c(5,6,8),"admission_type_id"] = "Not_Available" # 5,6 and 8 all correspond to data not available/NULL
+df[df$admission_type_id %in% c(1,2,7),"admission_type_id"] = "Emergency"
+df[df$admission_type_id %in% c(4),"admission_type_id"] = "Newborn"
+df[df$admission_type_id %in% c(3),"admission_type_id"] = "Elective"
+
+df = df[df$admission_type_id != "Newborn", ] # Ages for "Newborn" are inaccurate, remove entire rows
+df$admission_type_id <- as.factor(df$admission_type_id)
+
+## Admission source
+df$admission_source_id <- as.character(df$admission_source_id)
+df[df$admission_source_id %in% c(7),"admission_source_id"] = "Emergency_room"
+df[df$admission_source_id %in% c(1,2,3),"admission_source_id"] = "Referral"
+df[df$admission_source_id %in% c(9,15,17,20,21),"admission_source_id"] = "Not_available"
+df[df$admission_source_id %in% c(4,5,6,10,18,19,22,25,26),"admission_source_id"] = "Transfer"
+df[df$admission_source_id %in% c(8,11,12,13,14,23,24),"admission_source_id"] = "Other"
+df$admission_source_id <- as.factor(df$admission_source_id)
+
+## Discharge code
+df$discharge_disposition_id <- as.character(df$discharge_disposition_id)
+df[df$discharge_disposition_id %in% c(9,12),"discharge_disposition_id"] = "Remain_patient"
+df[df$discharge_disposition_id %in% c(2,3,4,5,7,10,15,16,17,22,23,24,30,27,28,29),"discharge_disposition_id"] = "Transferred"
+df[df$discharge_disposition_id %in% c(1,6,8),"discharge_disposition_id"] = "Discharged_to_home"
+df[df$discharge_disposition_id %in% c(18,25,26),"discharge_disposition_id"] = "Not_available"
+df$discharge_disposition_id <- as.factor(df$discharge_disposition_id)
+
+## Time in hospital
+# We want time in hospital to be treated as ordinal so we make it an ordered factor
+df$time_in_hospital = factor(df$time_in_hospital, ordered = TRUE)
+```
+
+##Statistical Analysis
+
+
+### check for outliers using boxplots 
+```{r}
+# str(train)
+#str(test)
+
+print(names(train)[sapply(train, is.integer)])
+
+names_numerical = names(train)[sapply(train, is.integer)]
+
+for (col in names(df[names_numerical])) {
+  
+  # Create Boxplots
+  boxplot(df[[col]], main = col, xlab = "Value")
+  
+  # Get boxplot statistics
+  bp <- boxplot.stats(df[[col]])
+  num_outliers <- length(bp$out)
+  print(paste("Number of outliers in", col, ":", num_outliers))
+
+  hist(df[[col]], main = col, xlab = "values")
+}
+
+# Fore the following features we have a low number of outliers- compared to number of instances
+
+# Number of outliers in num_lab_procedures : 98 (0.14%)
+# Number of outliers in number_diagnoses : 235 (0.33%)
+```
+
+### Check Ratio of Readmitted
+to see whether they affect the target variable
+```{r}
+#Num_lab_procedures ---
+
+box_num_lab = boxplot.stats(df[["num_lab_procedures"]])
+
+outliers_num_lab = box_num_lab$out
+
+outlier_indices <- which(df$num_lab_procedures %in% outliers_num_lab)
+df_outliers <- df[outlier_indices, ]
+
+# Compute the frequency distribution of the target variable for these outliers
+target_table <- table(df_outliers$readmitted)
+
+# Compute proportions
+target_prop <- prop.table(target_table)
+
+# Combine count and proportion into a single table
+target_table_with_prop <- cbind(Count = target_table, Proportion = target_prop)
+
+# Print the table
+print(target_table_with_prop)
+
+# Num_diagnosis
+
+box_num_diag = boxplot.stats(df[["number_diagnoses"]])
+
+outliers_num_diag = box_num_diag$out
+
+outlier_indices <- which(df$number_diagnoses %in% outliers_num_diag)
+df_outliers <- df[outlier_indices, ]
+
+# Compute the frequency distribution of the target variable for these outliers
+target_table <- table(df_outliers$readmitted)
+
+# Compute proportions
+target_prop <- prop.table(target_table)
+
+# Combine count and proportion into a single table
+target_table_with_prop <- cbind(Count = target_table, Proportion = target_prop)
+
+# Print the table
+print(target_table_with_prop)
+
+```
+
+###fairly even proportions so we can delete
+```{r}
+
+outliers_num_lab = boxplot.stats(df$num_lab_procedures)
+
+outliers_index_num_lab <- which(df$num_lab_procedures %in% outliers_num_lab$out)
+
+outliers_num_diag = boxplot.stats(df$number_diagnoses)
+
+outliers_index_num_diag <- which(df$number_diagnoses %in% outliers_num_diag$out)
+
+# Combine the indices of outliers
+outliers_index <- c(outliers_index_num_lab, outliers_index_num_diag)
+
+# Remove the instances with outliers
+df <- df[-outliers_index, ]
+
+# nrow(df) - 69645    
+
+```
+
+## Checking missing values again
+
+```{r}
+missing_values = sapply(df, function(x) any(x == "?")) # missing values denoted by "?"
+
+# Proportion of column with ? 
+sapply(df[missing_values], function(x) {round(
+  sum(x == "?") / length(x),3)
+})
+```
+
+###We will remove the rows with missing values now, it isn't worth imputing race or diagnoses.
+```{r}
+row_indices <- which(apply(df, 1, function(row) any(row == "?")))
+
+nrow(df) # nrow before = 69645
+
+df = df[-row_indices,]
+
+nrow(df) # nrow after = 66715
+```
+
+### Reviewing the dataframe
+Lots of models require numerical input only. Lots of our data is categorical so we encode it
+```{r}
+df = droplevels(df)
+str(df)
+```
+
+## Dealing with medications
+
+When it comes to medication there are 2 things we want to deal with:
+  a) whether or not a specific diabetes medication is used
+  b) whether the dosage is changed during a patients visit to hospital
+  
+To deal with this we create new variables named [medication].used and assign them
+a value based on whether that medication is listed as used ("Steady","Up","Down").
+
+We also change the original medication variable to "Up" "Down" and "No Change".
+```{r}
+library(dplyr)
+
+df <- df %>%
+  mutate(
+    metformin.used = as.factor(ifelse(metformin == "No", 0, 1)),
+    repaglinide.used = as.factor(ifelse(repaglinide == "No", 0, 1)),
+    nateglinide.used = as.factor(ifelse(nateglinide == "No", 0, 1)),
+    chlorpropamide.used = as.factor(ifelse(chlorpropamide == "No", 0, 1)),
+    glimepiride.used = as.factor(ifelse(glimepiride == "No", 0, 1)),
+    acetohexamide.used = as.factor(ifelse(acetohexamide == "No", 0, 1)),
+    glipizide.used = as.factor(ifelse(glipizide == "No", 0, 1)),
+    glyburide.used = as.factor(ifelse(glyburide == "No", 0, 1)),
+    tolbutamide.used = as.factor(ifelse(tolbutamide == "No", 0, 1)),
+    pioglitazone.used = as.factor(ifelse(pioglitazone == "No", 0, 1)),
+    rosiglitazone.used = as.factor(ifelse(rosiglitazone == "No", 0, 1)),
+    acarbose.used = as.factor(ifelse(acarbose == "No", 0, 1)),
+    miglitol.used = as.factor(ifelse(miglitol == "No", 0, 1)),
+    troglitazone.used = as.factor(ifelse(troglitazone == "No", 0, 1)),
+    tolazamide.used = as.factor(ifelse(tolazamide == "No", 0, 1)),
+    insulin.used = as.factor(ifelse(insulin == "No", 0, 1)),
+    glyburide.metformin.used = as.factor(ifelse(glyburide.metformin == "No", 0, 1)),
+    glipizide.metformin.used = as.factor(ifelse(glipizide.metformin == "No", 0, 1)),
+    metformin.pioglitazone.used = as.factor(ifelse(metformin.pioglitazone == "No", 0, 1))
+  )
+
+
+df <- df %>%
+  mutate_at(
+    vars(metformin:metformin.pioglitazone),
+    list(
+      ~factor(
+        case_when(
+          . %in% c("Up", "Down") ~ .,
+          TRUE ~ "No_Change"
+        ),
+        levels = c("Up", "Down", "No_Change")
+      )
+    )
+  )
+
+
+```
+
+
+We only want to keep medication factor variables with more than 2 levels (medications with "No"
+and "Steady" as the only levels do not tell us anything)
+```{r}
+df = droplevels(df)
+
+medication_names = c('metformin', 'repaglinide', 'nateglinide', 'chlorpropamide', 'glimepiride', 'acetohexamide',
+          'glipizide', 'glyburide', 'tolbutamide', 'pioglitazone', 'rosiglitazone', 'acarbose','miglitol',
+          'troglitazone', 'tolazamide', 'insulin', 'glyburide.metformin', 'glipizide.metformin', 'metformin.rosiglitazone', 'metformin.pioglitazone')
+
+level_fun = function(x){
+  nlevels(x)
+}
+
+med_levels = sapply(df[medication_names],level_fun)
+
+medication_indices = names(med_levels[med_levels<=2])
+
+df = df[, !(names(df) %in% medication_indices)]
+```
+
+```{r}
+str(df)
+```
+
+## Attempting feature selection
+First we look at the entropy of each variable. 
+```{r}
+calculate_entropy = function(x){
+  probabilities = table(x)/length(x)
+  probabilities <- probabilities[probabilities > 0]
+  entropy = -sum(probabilities * log(probabilities, base = 2))
+}
+
+# Calculate entropy for each feature
+feature_entropy <- sapply(df, calculate_entropy)
+
+# Output entropy values
+print(feature_entropy)
+
+```
+### Exploring low entropy features
+Features with low entropy indicate low uncertainty/high predictability because the feature doesn't have much variability.
+
+From the entropy values we investigate the relationship between features with very low entropy (<0.1) and readmission.
+
+```{r}
+low_entropy_features = names(feature_entropy[feature_entropy<0.1])
+# low_entropy_features = ["repaglinide"              "nateglinide"              "chlorpropamide"           "glimepiride"              "pioglitazone"             "rosiglitazone"           "acarbose"                 "miglitol"                 "glyburide.metformin"      "nateglinide.used"         "chlorpropamide.used"      "acarbose.used"           "miglitol.used"            "glyburide.metformin.used"]
+
+## Replace medication names to analyse number of observations/% readmitted
+table(df$metformin) # entropy=0.8 to compare distribution
+table(df$repaglinide) # entropy<0.1
+
+
+df %>%
+  group_by(repaglinide) %>%
+  summarise(observed = n(), proportion_readmitted = sum(readmitted==TRUE)/n()) %>%
+  arrange(desc(observed))
+
+
+```
+Given the number of observations where these medications are changed is so low, we remove this feature. 
+None of the % of readmittance with respect to number of observations are significant.
+
+
+```{r}
+df = df[, !(names(df) %in% low_entropy_features)]
+```
+
+### Exploring high entropy features
+Features with high entropy indicate high uncertainty or randomness in their distribution.
+
+```{r}
+high_entropy_features = names(feature_entropy[feature_entropy>2])
+# high_entropy_features = ["age"         "time_in_hospital"   "num_lab_procedures" "num_procedures"     "num_medications"    "diag_1"      "number_diagnoses"  ]
+
+
+## Replace medication names to analyse number of observations/% readmitted
+table(df$gender) # entropy=1 to compare distribution
+table(df$age) # entropy<0.1
+
+
+df %>%
+  group_by(age) %>%
+  summarise(observed = n(), proportion_readmitted = sum(readmitted==TRUE)/n()) %>%
+  arrange(desc(observed))
+```
+We believe the variables with high entropy will be useful in our predictions. 
+Looking at how % of readmittance changes with respect to a high entropy feature is useful.
+
+### Reviewing the dataframe (again)
+```{r}
+str(df)
+```
+
+## Performing interaction analysis between each variable and readmitted
+The reason for analysing how different variables interact with each other is:
+ - To enhance our understanding of how different factors contribute to diabetes
+ - Help us with feature selection and dimensionality reduction.
+      - We use only the most informative variables
+
+We want to analyse how each variable interacts with the target (readmission).
+
+response variable = "readmitted"
+predictor = every other column
+
+```{r, eval = FALSE}
+p_values <- data.frame(
+  Variable = rep("", (ncol(df)-1)),
+  P_value = rep("", (ncol(df)-1))
+)
+
+for (i in 1:(ncol(df)-1)){
+  
+predictor = names(df)[i]  
+print(predictor)
+formula <- paste("readmitted ~ . -", predictor)
+
+model <- glm(formula, data = df, family = binomial(link = "logit"))
+
+# Reduced model 
+reduced_model <- glm(readmitted ~ ., data = df, family = binomial(link = "logit"))
+
+# Perform likelihood ratio test (comparing full model to reduced model)
+lr_test <- anova(model, reduced_model, test = "Chisq")
+
+
+# Add p-value to table
+p_values[i,1] = names(df)[i]
+p_values[i,2] = lr_test$"Pr(>Chi)"[2] # p-value of likelihood ratio test
+
+p_values[,2] = as.numeric(p_values[,2])
+}
+
+insignificant_var = which(p_values[,3]>0.05)
+
+write.csv(p_values, "p-values")
+```
+
+```{r}
+# The code takes a while - the results are uploaded as a csv 
+p_values = read.csv("p-values.csv") 
+
+insignificant_var = which(p_values[,3]>0.05)
+
+p_values[insignificant_var,1]
+```
+
+###Interpreting table: 
+
+Variables that give a p-value <0.05 in the likelihood ratio test are statistically 
+significant, meaning we have reason to reject H0 and we conclude that this predictor
+significantly improves the fit of the model.
+
+Alternatively, all variables that have a p-value >0.05 in the likelihood ratio test 
+don't provide enough evidence to reject H0 so we cannot conclude that this variable 
+improves the model fit. Meaning we cannot present a relationship between the variable 
+and readmission.
+
+```{r}
+# ncol(df) # number of predictors before = 33
+
+df = df[,-insignificant_var]
+
+# ncol(df) # number of predictor after = 25
+```
+
+
+## Training set and test set division
+```{r}
+# Setting seeds to ensure repeatable results
+set.seed(1)
+
+index = sample(nrow(df), size = nrow(df)*0.9, replace = FALSE)
+
+train = df[index, ]
+test = df[-index, ]
+
+```
+
+## Statistical Analysis 2.0
+
+We do the second part of the statistical analysis after the Training - Test split, as we want to avoid data leakage.
+
+###Check for skewness in numerical features
+
+
+```{r}
+# str(train)
+#str(test)
+
+print(names(train)[sapply(train, is.integer)])
+
+names_numerical = names(train)[sapply(train, is.integer)]
+
+for (col in names(train[names_numerical])) {
+  print(paste("Skewness of", col, "is:",skewness(train[[col]])))
+  hist(train[[col]], main = col, xlab = "values")
+}
+
+```
+
+
+
+## One-Hot Encoding 
+```{r}
+encoded_df <- as.data.frame(model.matrix(~ ., data = df))
+
+encoded_train = encoded_df[index, ]
+encoded_train = encoded_train[,-which(names(encoded_train)=="readmittedTRUE")]
+encoded_test = encoded_df[-index, ]
+encoded_test = encoded_test[,-which(names(encoded_test)=="readmittedTRUE")]
+
+target_train = train[,which(names(df)=="readmitted")]
+target_encoded_train = as.numeric(target_train)
+
+target_test = test[,which(names(df)=="readmitted")]
+target_encoded_test = as.numeric(target_test)
+```
+
+# MODELS -------
+
+
+```{r}
+str(df)
+```
+
+
+```{r}
+## Naive Bayes with top p-values
+names(df)[order(p_values$P_value)]
+
+preds = cbind(train$admission_source_id,train$age,train$num_diagnoses,train$number_visit)
+
+library(naivebayes)
+nb=naive_bayes(x=preds,y=train$readmitted)
+
+preds2 = cbind(test$admission_source_id,test$age,test$num_diagnoses,test$number_visit)
+predicted_readmitted = predict(nb,newdata=preds2)
+
+confusion_matrix <- table(test$readmitted, predicted_readmitted)
+print(confusion_matrix)
+
+# Calculate accuracy
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+print(paste("Accuracy:", accuracy))
+
+
+```
+
+
+## Decision Tree
+
+### Hyperparameter Tuning
+```{r}
+
+
+# Set up the training control with verbose output
+train_control <- trainControl(method = "cv", number = 10, verboseIter = TRUE)
+
+# Define a simple tuning grid focusing on 'cp'
+tune_grid <- expand.grid(cp = seq(0.01, 0.1, by = 0.02))
+
+# Train the decision tree model
+tree_model <- train(
+  readmitted ~ .,
+  data = train,
+  method = "rpart",
+  trControl = train_control,
+  tuneGrid = tune_grid,
+  metric = "Accuracy"
+)
+
+# Print the trained model details and plot it
+print(tree_model)
+rpart.plot(tree_model$finalModel)
+
+
+```
+
+
+### Best_Model
+
+```{r}
+start_time <- Sys.time()
+
+# Set up the training control with verbose output
+best_control <- trainControl(method = "cv", number = 10, verboseIter = TRUE)
+
+# Define a simple tuning grid focusing on 'cp'
+best_grid <- expand.grid(cp = 0.01)
+
+# Train the decision tree model
+best_tree_model <- train(
+  readmitted ~ .,
+  data = train,
+  method = "rpart",
+  trControl = best_control,
+  tuneGrid = best_grid,
+  metric = "Accuracy"
+)
+
+# End measuring time
+end_time <- Sys.time()
+time_taken <- end_time - start_time
+print(paste("Training time Decision Tree: ", time_taken))
+```
+
+### Plot
+```{r}
+# Print the trained model details and plot it
+print(best_tree_model)
+rpart.plot(best_tree_model$finalModel)
+```
+
+
+###Prediction
+```{r}
+start_time <- Sys.time()
+
+pred <- predict(best_tree_model, newdata = test)
+
+# End measuring time
+end_time <- Sys.time()
+
+# Calculate and print the time taken
+time_taken <- end_time - start_time
+print(paste("Training time Decision Tree: ", time_taken))
+
+confusionMatrix(as.factor(pred),
+                as.factor(test$readmitted))
+
+confusion_matrix <- table(test$readmitted, pred)
+print(confusion_matrix)
+```
+time take 0.55 s
+Accuracy= 61.36%
+
+## Logistic regression model w/Cross validation
+```{r}
+# Load required libraries
+library(caret)
+start_time <- Sys.time()
+
+# Define the number of folds for cross-validation
+num_folds <- 5
+
+# Create a data partition for cross-validation
+set.seed(1)  # For reproducibility
+folds <- createFolds(train$readmitted, k = num_folds)
+
+# Define the control parameters for cross-validation
+ctrl <- trainControl(method = "cv", index = folds)
+
+# Train the logistic regression model using k-fold cross-validation
+log_model <- train(readmitted ~ ., data = train, method = "glm", family = "binomial", trControl = ctrl)
+
+# Print the trained model
+print(log_model)
+
+# Assess model performance
+print(summary(log_model))
+
+# Optionally, you can access the cross-validation results
+print(log_model$results)
+
+# End measuring time
+end_time <- Sys.time()
+
+# Calculate and print the time taken
+time_taken <- end_time - start_time
+print(paste("Training time Logistic regression: ", time_taken))
+
+```
+Accuracy = 61.71%
+
+## Predictions
+```{r}
+start_time <- Sys.time()
+
+pred <- predict(log_model, newdata = test)
+
+# End measuring time
+end_time <- Sys.time()
+
+# Calculate and print the time taken
+time_taken <- end_time - start_time
+print(paste("Training time Logistic: ", time_taken))
+
+confusionMatrix(as.factor(pred),
+                as.factor(test$readmitted))
+```
+
+
+##Edo Neural Network
+
+### Tuning
+```{r, eval = FALSE}
+
+library(nnet)
+
+# Define the control parameters for the neural network model
+nn_ctrl <- trainControl(method = "cv", number = 5)  # 5-fold cross-validation
+
+# Define the parameter grid for tuning
+nn_tuneGrid <- expand.grid(size = seq(5, 20, by = 5),  # Number of hidden units
+                        decay = c(0, 0.1, 0.01))   # Weight decay parameter
+
+# Perform the hyperparameter tuning
+nn_grid <- train(x = encoded_train,
+                 y = target_train,
+                 method = "nnet",
+                 trControl = nn_ctrl,
+                 tuneGrid = nn_tuneGrid)
+
+
+```
+
+
+### Best Model
+
+```{r}
+start_time <- Sys.time()
+# Define the control parameters for the neural network model
+best_nn_ctrl <- trainControl(method = "cv", number = 5)  # 5-fold cross-validation
+
+# Define the parameter grid for tuning
+best_nn_Grid <- expand.grid(size = 10,  # Number of hidden units
+                        decay = 0.10)   # Weight decay parameter
+
+# Perform the hyperparameter tuning
+best_nn_grid <- train(x = encoded_train,
+                 y = target_train,
+                 method = "nnet",
+                 trControl = best_nn_ctrl,
+                 tuneGrid = best_nn_Grid)
+
+end_time <- Sys.time()
+time_taken <- end_time - start_time
+print(paste("Training time NN: ", time_taken))
+```
+
+```{r}
+
+start_time <- Sys.time()
+
+# Predict using NN ---- 
+pred <- predict(best_nn_grid, newdata = encoded_test)
+
+# End measuring time
+end_time <- Sys.time()
+
+# Calculate and print the time taken
+time_taken <- end_time - start_time
+print(paste("Training time NN: ", time_taken))
+
+
+
+confusionMatrix(as.factor(pred),
+                as.factor(target_test))
+```
+time taken: ~ 0.07
+
+###Plot
+
+```{r}
+
+start_time <- Sys.time()
+
+# Predict using NN ---- 
+pred <- predict(best_nn_grid, newdata = encoded_test)
+
+# End measuring time
+end_time <- Sys.time()
+
+# Calculate and print the time taken
+time_taken <- end_time - start_time
+print(time_taken)
+
+
+
+confusionMatrix(as.factor(pred),
+                as.factor(target_test))
+```
+
+
+##Random Forest
+
+```{r}
+start_time <- Sys.time()
+library(randomForest)
+
+# Split the data into predictors (X) and target variable (Y)
+X <- train[, -which(names(train) == "readmitted")]  # Excluding the target variable
+Y <- train$readmitted
+
+# Train the random forest model
+set.seed(123)  # for reproducibility
+rf_model <- randomForest(x = X, y = Y, ntree = 100)  # You can adjust the number of trees (ntree) as needed
+
+# Check model summary
+print(rf_model)
+
+end_time <- Sys.time()
+
+# Calculate and print the time taken
+time_taken <- end_time - start_time
+print(paste("Training time NN: ", time_taken))
+
+# Predictions on training data
+pred <- predict(rf_model, test[,-which(names(test) == "readmitted")])
+
+confusionMatrix(as.factor(pred),
+                as.factor(test$readmitted))
+
+varImpPlot(rf_model)
+
+```
+
+
+### prediction
+```{r}
+
+start_time <- Sys.time()
+
+pred <- predict(rf_model, newdata = test)
+
+# End measuring time
+end_time <- Sys.time()
+
+# Calculate and print the time taken
+time_taken <- end_time - start_time
+print(paste("Training time RF: ", time_taken))
+
+confusionMatrix(as.factor(pred),
+                as.factor(test$readmitted))
+
+```
+
+time taken: 0.66
+
+### ROC
+```{r}
+
+#version2
+ROCit_obj <- rocit(score=as.numeric(pred),class= as.numeric(target_test))
+plot(ROCit_obj) 
+title(main = "ROC Curve - Random Forest")
+
+auc_value <- round(ROCit_obj$AUC, digits = 4)  # Round the AUC to 4 decimal places for better readability
+auc_text <- paste("AUC =", auc_value)  # Create a string to display
+
+# Choose a location on the plot for the AUC text. (x=0.6, y=0.2) is usually in the lower right of the plot.
+text(x = 0.6, y = 0.4, labels = auc_text, cex = 1.2)
+
+```
+
+### Gini
+```{r}
+gini_importance = importance(rf_model, type=2)
+
+gini_importance$Feature <- rownames(gini_importance)
+
+gini_df <- data.frame(
+  MeanDecreaseGini = unlist(gini_importance[1:24]),
+  Feature = gini_importance$Feature
+)
+
+
+gini_df$Feature <- factor(gini_df$Feature, levels = gini_df$Feature[order(gini_df$MeanDecreaseGini)])
+
+
+
+# Create horizontal bar plot
+ggplot(gini_df, aes(x = MeanDecreaseGini/sum(MeanDecreaseGini), y = Feature)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(x = "Normalised Gini Decrease", y = "Feature", title = "Gini Importance for Different Features") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 9)) 
+
+```
+
+
+## XGBoost 
+
+###hyperparameter Tuning 
+```{r,eval=FALSE}
+
+# Convert target_train to factor with two levels
+target_train <- factor(target_train, levels = c(0, 1))
+
+# Define parameter grid
+param_grid <- expand.grid(
+  nrounds = c(500, 1000, 1500),
+  max_depth = c(2, 4, 6),
+  eta = 0.3,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+# Perform grid search with cross-validation
+ctrl <- trainControl(method = "cv", 
+                     number = 5,
+                     verboseIter = TRUE,
+                     allowParallel = TRUE)
+
+
+xgb_tune <- train(
+  x = as.matrix(encoded_train),
+  y = target_train,
+  method = "xgbTree",
+  trControl = ctrl,
+  tuneGrid = param_grid,
+  verbose = TRUE
+)
+
+# Print the best parameters
+print(xgb_tune)
+
+```
+From this we pick the best parameters.
+
+ max_depth  nrounds  Accuracy   Kappa    
+  2           500     0.6261513  0.1823397
+  2          1000     0.6256849  0.1839391
+  2          1500     0.6242193  0.1823085
+
+
+###Best model
+```{r}
+start_time <- Sys.time()
+
+best_grid <- expand.grid(
+  nrounds = 500,
+  max_depth = 2,
+  eta = 0.3,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+# Perform grid search with cross-validation
+best_ctrl <- trainControl(method = "cv", 
+                     number = 5,
+                     verboseIter = TRUE,
+                     allowParallel = TRUE)
+
+
+xgb_model <- train(
+  x = as.matrix(encoded_train),
+  y = target_train,
+  method = "xgbTree",
+  trControl =  best_ctrl,
+  tuneGrid = best_grid,
+  verbose = TRUE
+)
+end_time <- Sys.time()
+
+# Calculate and print the time taken
+time_taken <- end_time - start_time
+print(paste("Training time NN: ", time_taken))
+
+```
+
+
+###Prediction
+
+```{r}
+
+start_time <- Sys.time()
+
+# Predict using XGBoost ---- 
+pred <- predict(xgb_model, newdata = encoded_test)
+
+# End measuring time
+end_time <- Sys.time()
+
+# Calculate and print the time taken
+time_taken <- end_time - start_time
+print(paste("Training time XGBoost: ", time_taken))
+
+confusionMatrix(as.factor(pred),
+                as.factor(target_test))
+
+```
+time take  0.07
+
+
+### Plots
+
+```{r}
+
+# plot the first tree
+xgb.plot.tree(model = xgb_model$finalModel, trees = 1)
+
+```
+
+###ROC curve
+```{r}
+
+#version2
+ROCit_obj <- rocit(score=as.numeric(pred),class= as.numeric(target_test))
+plot(ROCit_obj)
+title(main = "ROC Curve - XGBoost")
+
+auc_value <- round(ROCit_obj$AUC, digits = 4)  # Round the AUC to 4 decimal places for better readability
+auc_text <- paste("AUC =", auc_value)  # Create a string to display
+
+# Choose a location on the plot for the AUC text. (x=0.6, y=0.2) is usually in the lower right of the plot.
+text(x = 0.6, y = 0.4, labels = auc_text, cex = 1.2)
+
+```
+
+## Lasso
+Lasso is chosen to reduce the number of variable
+```{r}
+lasso_model = glmnet(encoded_train,target_encoded_train,family = "binomial", alpha = 1)
+max(lasso_model$lambda)
+#summary(lasso_model)
+#print(lasso_model)
+plot(lasso_model,xvar="lambda")
+
+#View(encoded_train)
+
+#Cross Validation
+set.seed(1)
+cv_model = cv.glmnet(as.matrix(encoded_train),target_encoded_train,family = "binomial", alpha = 1,type.measure = "class", nfolds = 10)
+plot(cv_model)
+
+#Choose Lambda
+#lambda_min : lambda with the least error in CV
+lambda_min <-cv_model$lambda.min
+coef_min <-coef(cv_model,s="lambda.min")
+
+#lambda_1se : the maximum lambda value that is within one standard error of the optimal performance in cross-validation
+lambda_1se <-cv_model$lambda.1se
+coef_1se <-coef(cv_model,s="lambda.1se")
+
+#customize lambda
+lambda_1 = exp(-4) #Large reductions in variables with minor changes in model accuracy
+lambda_2 = exp(-3.5)
+
+#fit the model with different lambdas
+```
+
+
+```{r}
+#best performance lasso model lasso_model_min
+start_time <- Sys.time()
+lasso_model_min = glmnet(encoded_train,target_encoded_train,family = "binomial", alpha = 1, lambda = 3.02*10^-2)
+end_time <- Sys.time()
+time_taken <- end_time - start_time
+print(paste("Training time Lasso: ", time_taken))
+```
+
+
+```{r}
+lasso_model_1se = glmnet(encoded_train,target_encoded_train,family = "binomial", alpha = 1, lambda = lambda_1se)
+lasso_model_1 = glmnet(encoded_train,target_encoded_train,family = "binomial", alpha = 1, lambda = lambda_1)
+lasso_model_2 = glmnet(encoded_train,target_encoded_train,family = "binomial", alpha = 1, lambda = lambda_2)
+
+#left coeffs num with different lambdas
+length_min = length(which(coef(lasso_model_min)!=0))
+length_1se = length(which(coef(lasso_model_1se)!=0))
+length_1 = length(which(coef(lasso_model_1)!=0))
+length_2 = length(which(coef(lasso_model_2)!=0))
+
+```
+
+## Prediction
+```{r}
+#fit the models with the test set
+
+start_time <- Sys.time()
+lasso_predictions_min = predict(lasso_model_min, newx = as.matrix(encoded_test), type = "response")
+predicted_classes_min <- ifelse(lasso_predictions_min > 0.5, 1, 0) 
+end_time <- Sys.time()
+time_taken <- end_time - start_time
+print(paste("Prediction time Lasso: ", time_taken))
+```
+
+
+```{r}
+lasso_predictions_1se = predict(lasso_model_1se, newx = as.matrix(encoded_test), type = "response")
+predicted_classes_1se <- ifelse(lasso_predictions_1se > 0.5, 1, 0) 
+
+lasso_predictions_1 = predict(lasso_model_1, newx = as.matrix(encoded_test), type = "response")
+predicted_classes_1 <- ifelse(lasso_predictions_1 > 0.5, 1, 0) 
+
+lasso_predictions_2 = predict(lasso_model_2, newx = as.matrix(encoded_test), type = "response")
+predicted_classes_2 <- ifelse(lasso_predictions_2 > 0.5, 1, 0)
+
+```
+
+# Performance
+```{r}
+#model performance
+confusion_matrix_min <- table(predicted_classes_min, target_encoded_test)
+accuracy_min <- sum(diag(confusion_matrix_min)) / sum(confusion_matrix_min)
+
+confusion_matrix_1se <- table(predicted_classes_1se, target_encoded_test)
+accuracy_1se <- sum(diag(confusion_matrix_1se)) / sum(confusion_matrix_1se)
+
+confusion_matrix_1 <- table(predicted_classes_1, target_encoded_test)
+accuracy_1 <- sum(diag(confusion_matrix_1)) / sum(confusion_matrix_1)
+
+confusion_matrix_2 <- table(predicted_classes_2, target_encoded_test)
+accuracy_2 <- sum(diag(confusion_matrix_2)) / sum(confusion_matrix_2)
+```
+
+
+```{r}
+accuracy_min; accuracy_1se; accuracy_1; accuracy_2
+length_min;length_1se;length_1; length_2
+lambda_min; lambda_1se; lambda_1; lambda_2
+
+
+#lasso_model_2's coefficients
+coefficients <- coef(lasso_model_2)
+variable_names <- rownames(coefficients)
+non_zero_coeffs <- which(coef(lasso_model_2) != 0)
+print(variable_names[non_zero_coeffs])
+
+#best lasso model lasso_model_min performancecat("Best lasso model performance:")
+confusion_matrix_min
+cat("Accuracy:", accuracy_min, "\n")
+
+TP <- confusion_matrix_min[2, 2] 
+TN <- confusion_matrix_min[1, 1] 
+FP <- confusion_matrix_min[1, 2] 
+FN <- confusion_matrix_min[2, 1]
+
+sensitivity <- TP / (TP + FN)
+cat("Sensitivity:", sensitivity, "\n")
+
+specificity <- TN / (TN + FP)
+cat("Specificity:", specificity, "\n")
+
+
+```
